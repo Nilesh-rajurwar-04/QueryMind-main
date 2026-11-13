@@ -1,0 +1,105 @@
+package com.querymind.query.engine;
+
+import net.sf.jsqlparser.JSQLParserException;
+import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.Statement;
+import net.sf.jsqlparser.statement.select.Select;
+import org.springframework.stereotype.Component;
+
+/**
+ * AST-based validation stage of SafeExecutionEngine (memory.md §2 / phases.md
+ * Phase3). Rejects anything that is not a single, pure SELECT statement.
+ * This is the single most important security control in the system —
+ * changes here require an expanded "should reject" test case (rules.md §8).
+ */
+@Component
+public class SqlValidator {
+
+    private static final String[] FORBIDDEN_KEYWORDS = {
+        "INTO OUTFILE", "INTO DUMPFILE", "LOAD_FILE", "LOAD DATA"
+    };
+
+    public record ValidationResult(Select select, String normalizedSql) {}
+
+    public ValidationResult validate(String rawSql) {
+        if (rawSql == null || rawSql.isBlank()) {
+            throw new SqlRejectedException("Empty statement");
+        }
+
+        // Reject SQL comments outright, BEFORE parsing. A trailing "-- ..."
+        // or "/* ... */" is a syntactically valid part of a single SELECT as
+        // far as JSQLParser is concerned (it's just discarded), which means
+        // injected text hidden in a comment (e.g. "... WHERE id=1 -- ; DROP
+        // TABLE users") never survives to any post-parse check — the parser
+        // and the re-rendered statement have both already dropped it. No
+        // legitimate analytical query needs a comment, so the safest rule is
+        // to block comment syntax entirely rather than try to inspect what's
+        // inside one.
+        if (containsSqlComment(rawSql)) {
+            throw new SqlRejectedException(
+                    "Statement blocked: SQL comments are not allowed (comment-injection risk)");
+        }
+
+        String upper = rawSql.toUpperCase();
+        for (String forbidden : FORBIDDEN_KEYWORDS) {
+            if (upper.contains(forbidden)) {
+                throw new SqlRejectedException(
+                        "Statement blocked: contains file-system operation (" + forbidden + ")");
+            }
+        }
+
+        Statement statement;
+        try {
+            // CCJSqlParserUtil.parse requires the input to be exactly one
+            // statement followed by EOF (optionally with a trailing `;`).
+            // Stacked queries ("SELECT 1; DROP TABLE x") fail to parse here.
+            statement = CCJSqlParserUtil.parse(rawSql);
+        } catch (JSQLParserException e) {
+            throw new SqlRejectedException("Statement could not be parsed as valid SQL: could not verify it is a single safe SELECT");
+        }
+
+        if (!(statement instanceof Select select)) {
+            throw new SqlRejectedException(
+                    "This looks like a write operation and has been blocked. Only SELECT statements are allowed.");
+        }
+
+        // Defense in depth: reject a Select whose body still contains a
+        // semicolon (shouldn't be reachable given the parser above, but
+        // guards against future JSQLParser leniency changes).
+        String rendered = select.toString();
+        if (rendered.contains(";")) {
+            throw new SqlRejectedException("Multi-statement input is not allowed");
+        }
+
+        return new ValidationResult(select, rendered);
+    }
+
+    /**
+     * Detects `--` line comments and `/* ... *\/` block comments, ignoring
+     * occurrences inside single- or double-quoted string literals (so a
+     * legitimate value like "email LIKE '%--fun%'" isn't falsely rejected).
+     */
+    private boolean containsSqlComment(String sql) {
+        boolean inSingleQuote = false;
+        boolean inDoubleQuote = false;
+        for (int i = 0; i < sql.length(); i++) {
+            char c = sql.charAt(i);
+            if (c == '\'' && !inDoubleQuote) {
+                inSingleQuote = !inSingleQuote;
+            } else if (c == '"' && !inSingleQuote) {
+                inDoubleQuote = !inDoubleQuote;
+            } else if (!inSingleQuote && !inDoubleQuote) {
+                if (c == '-' && i + 1 < sql.length() && sql.charAt(i + 1) == '-') {
+                    return true;
+                }
+                if (c == '/' && i + 1 < sql.length() && sql.charAt(i + 1) == '*') {
+                    return true;
+                }
+                if (c == '#') {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
